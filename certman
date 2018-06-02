@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import os
+import subprocess
+import sys
+
+import yaml
+from yaml.scanner import ScannerError
+
+
+logging.basicConfig(
+    filename="/tmp/certman.log",
+    level=logging.INFO, filemode="w",
+    format="[%(asctime)s] %(name)s | %(funcName)-20s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger('certman')
+logger.setLevel(logging.INFO)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Manage LE certificates")
+
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config",
+        required=False,
+        default="/etc/certman/certman.yaml",
+        type=str,
+        help="The configuration file for certman"
+    )
+
+    parser.add_argument(
+        "-r",
+        "--renew",
+        dest="renew",
+        action="store_true",
+        default=False,
+        help="Force renew all config defined certs using let's encrypt "
+             "(Use in case of a breach or to renew all certs manually)"
+    )
+
+    parser.add_argument(
+        "-s",
+        "--standalone",
+        dest="standalone",
+        action="store_true",
+        default=False,
+        help="Start a standalone web validation server "
+             "on port 443 to validate the certificate"
+    )
+
+    parser.add_argument(
+        "-n",
+        "--no-aftercare",
+        dest="aftercare",
+        action="store_false",
+        default=True,
+        required=False,
+        help="Do not run any command after renewing the certificates"
+    )
+
+    parser.add_argument(
+        "-d",
+        "--domain",
+        dest="domain",
+        required=False,
+        default="",
+        type=str,
+        help="Request a certificate for a single domain in the config file "
+             "(Renew for a single project)"
+    )
+
+    arguments = parser.parse_args()
+
+    if not os.path.isfile(arguments.config):
+        parser.error("Config file {} not found!".format(arguments.config))
+
+    return arguments
+
+
+def manage_firewall(action='close'):
+    command = '/sbin/iptables -D INPUT -p tcp --dport 443 -j ACCEPT'
+    if action != 'close':
+        command = '/sbin/iptables -I INPUT -p tcp --dport 443 -j ACCEPT'
+
+    try:
+        logger.info("Setting firewall to {}".format(action))
+        subprocess.check_call(command, shell=True)
+    except (ValueError, subprocess.CalledProcessError) as e:
+        raise RuntimeError("Failed to {} firewall: {}".format(action, e))
+
+
+class Certificate(object):
+    LETSENCRYPT_BASE_COMMAND = 'bash -c "/usr/bin/certbot certonly' \
+                               '  --agree-tos ' \
+                               '  --renew-by-default ' \
+                               '  --text '
+
+    def __init__(self, name, aliases, aftercare):
+        self.name = name
+        self.aliases = aliases
+        self.aftercare = aftercare
+
+    def __cert_file(self):
+        return '/etc/letsencrypt/live/{}/cert.pem'.format(self.name)
+
+    def __days_remaining(self):
+        if not os.path.isfile(self.__cert_file()):
+            return None
+        try:
+            command = 'echo "$(((($(date +%s -d "$(openssl x509 -in {0} -noout -enddate | sed -n "s/notAfter=//p")") - $(date +%s)) / 86400)))" >&1'.format(self.__cert_file())
+            output = subprocess.check_output(command, shell=True)
+            output = output.decode('utf-8')
+            return int(output.strip('\n'))
+        except (ValueError, subprocess.CalledProcessError):
+            raise RuntimeError("Failed to get remaining days from certificate file {}".format(self.__cert_file()))
+
+    def __domain_string(self):
+        if self.aliases:
+            return "-d {} -d ".format(self.name) + " -d ".join(self.aliases)
+        return "-d {}".format(self.name)
+
+    def __command(self, standalone=False):
+        if standalone:
+            return self.LETSENCRYPT_BASE_COMMAND + ' --standalone --authenticator standalone ' \
+                                                   '--config /etc/letsencrypt/cli.ini {}"'.format(self.__domain_string())
+
+        return self.LETSENCRYPT_BASE_COMMAND + ' --webroot --webroot-path /data/www/default ' \
+                                               '--config /etc/letsencrypt/cli.ini {}"'.format(self.__domain_string())
+
+    def renew(self, force=False, standalone=False):
+        days_remaining = self.__days_remaining()
+
+        if force or not days_remaining or days_remaining <= 21:
+            try:
+                logger.info('Certificate for {} expires in {} days! '
+                                  'Renewing letsencrypt certificate'.format(self.name, days_remaining))
+
+                if standalone:
+                    manage_firewall(action='open')
+
+                command = self.__command(standalone=standalone)
+                subprocess.check_call(command, shell=True)
+
+                if standalone:
+                    manage_firewall()
+
+                logger.info('Certificate for {} was renewed!'.format(self.name))
+                return True
+
+            except (ValueError, subprocess.CalledProcessError, RuntimeError) as e:
+                logger.error('Failed to renew certificate for {} - {}'.format(self.name, e))
+                return False
+
+    def run_aftercare(self):
+        for command in set(self.aftercare):
+            print('Running post-command "{}"'.format(command))
+            subprocess.check_call(command, shell=True)
+
+
+class CertManError(RuntimeError):
+    pass
+
+
+class CertManager(object):
+    def __init__(self, config_file, name=None, force_renew=False, standalone=False, do_aftercare=True):
+        self.name = name
+
+        self.config_file = config_file
+        self.config_dict = self.__read_yaml()
+
+        self.standalone = standalone or self.config_dict.get('standalone', False)
+        self.force_renew = force_renew or self.config_dict.get('force_renew', False)
+        self.do_aftercare = do_aftercare or self.config_dict.get('do_aftercare', True)
+
+    def __read_yaml(self):
+        logger.info("Reading configuration file: {}".format(self.config_file))
+
+        try:
+            with open(self.config_file) as fh:
+                return yaml.load(fh.read())
+        except (ScannerError, IOError, OSError) as e:
+            raise CertManError("Error while reading configuration file {}: {]".format(self.config_file, e))
+
+    def certificates(self):
+        return [Certificate(**element) for element in self.config_dict.get("certificates", {})]
+
+    def is_certificate(self, name):
+        return name in self.config_dict.get("certificates", {})
+
+    def get_certificate_by_name(self, name):
+        for cert in self.config_dict.get("certificates", {}):
+            if cert.get("name") == name:
+                return Certificate(**cert)
+
+    def run(self):
+        if self.name and self.is_certificate(self.name):
+            certificates = [self.get_certificate_by_name(self.name)]
+        else:
+            certificates = self.certificates()
+
+        for certificate in certificates:
+            renewed = certificate.renew(force=self.force_renew)
+            if renewed and self.do_aftercare:
+                certificate.run_aftercare()
+
+
+def main():
+    if os.geteuid() != 0:
+        print("You need to have root privileges to run this script.\n"
+              "Please try again using 'sudo {}'. Exiting.".format(" ".join(sys.argv)), file=sys.stderr)
+        sys.exit(0)
+
+    arguments = parse_arguments()
+
+    cert_manager = CertManager(
+        config_file=arguments.config,
+        name=arguments.domain,
+        force_renew=arguments.renew,
+        standalone=arguments.standalone,
+        do_aftercare=arguments.aftercare
+    )
+    cert_manager.run()
+
+
+if __name__ == "__main__":
+    main()

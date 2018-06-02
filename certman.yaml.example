@@ -1,0 +1,18 @@
+
+standalone: false
+force_renew: false
+do_aftercare: true
+
+certificates:
+  - name: example.com
+    aliases:
+        - www.example.com
+        - example.net
+        - www.example.net
+    aftercare:
+      - "service nginx reload"
+
+  - name: server.example.com
+    aliases: server.example.net
+    aftercare:
+      - "service postfix reload"
