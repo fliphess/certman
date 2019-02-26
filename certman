@@ -87,7 +87,7 @@ def parse_arguments():
 
 
 def manage_firewall(action='close'):
-    command = '/sbin/iptables -D INPUT -p tcp --dport 443 -j ACCEPT'
+    command = '/sbin/iptables -D INPUT -p tcp --dport 443 -j DROP'
     if action != 'close':
         command = '/sbin/iptables -I INPUT -p tcp --dport 443 -j ACCEPT'
 
